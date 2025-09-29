@@ -10,12 +10,12 @@
     }
   },
   "bot": {
-    "purchaseAmount": "1000000000000000000",
+    "purchaseAmount": "3000000000000000000",
     "slippageBps": 300,
     "gasBribeBps": 1000,
     "maxDevBuySupplyBps": 10
   },
   "filters": { "onlyHyped": true },
-  "sell": { "enabled": true, "takeProfitBps": 6000, "hardStopBps": 0, "minHoldBlocks": 3 }
+  "sell": { "enabled": true, "takeProfitBps": 3000, "hardStopBps": 1000, "minHoldBlocks": 3 }
 }
 

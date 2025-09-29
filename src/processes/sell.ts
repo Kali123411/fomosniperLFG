@@ -1,20 +1,20 @@
 import type { Address } from 'viem';
 import { erc20Abi, curveSellAbi } from '../abi/sell';
-import { allPositions } from '../positions';
+import { allPositions, removePosition } from '../positions';
 
 type Cfg = {
   slippageBps: number;    // e.g. 300 = 3%
   takeProfitBps: number;  // e.g. 6000 = +60%
-  hardStopBps: number;    // e.g. 0 (no forced loss sell) or 1000 = -10%
-  minHoldBlocks: number;  // e.g. 3 blocks
+  hardStopBps: number;    // 0 = disabled, or 1000 = -10%
+  minHoldBlocks: number;  // e.g. 3
 };
 
 const DBG = process.env.SELL_DEBUG === '1';
 const MAX_UINT256 = (1n << 256n) - 1n;
 const bps = (n: bigint, d: bigint) => Number((n * 10000n) / (d || 1n));
 
-// Prevent re-entrancy/double processing per token while approvals/txs are pending
-const inFlight = new Set<string>(); // key = token lowercase
+// prevent concurrent processing per token
+const inFlight = new Set<string>(); // tokenLower
 
 async function ensureAllowance(
   pub: any,
@@ -24,7 +24,6 @@ async function ensureAllowance(
   required: bigint
 ) {
   const owner = wal.account.address as Address;
-
   const current: bigint = await pub.readContract({
     address: token,
     abi: erc20Abi,
@@ -34,7 +33,7 @@ async function ensureAllowance(
 
   if (current >= required) return;
 
-  // Some ERC20s require zeroing first (USDT-style).
+  // Some tokens require zeroing first
   if (current > 0n) {
     if (DBG) console.log('[Seller] approve(0) first', { token, spender });
     const tx0 = await wal.writeContract({
@@ -46,7 +45,6 @@ async function ensureAllowance(
     await pub.waitForTransactionReceipt({ hash: tx0 });
   }
 
-  // Approve max to avoid re-approving on every sell
   if (DBG) console.log('[Seller] approving MAX', { token, spender });
   const tx1 = await wal.writeContract({
     address: token,
@@ -58,15 +56,15 @@ async function ensureAllowance(
 }
 
 export function startSellLoop(pub: any, wal: any, cfg: Cfg) {
-  // IMPORTANT: pass the WS client as `pub` from index.ts
   pub.watchBlocks({
-    emitMissed: false,          // don't backfill with HTTP; avoids BlockNotFound races
+    emitMissed: false,
     includeTransactions: false,
     poll: false,
 
     onBlock: async (block: any) => {
       const blockNumber: bigint | undefined = block?.number;
       if (!blockNumber) return;
+
       const positions = allPositions();
       if (DBG) console.log(`[SellLoop] block=${blockNumber.toString()} positions=${positions.length}`);
 
@@ -75,19 +73,19 @@ export function startSellLoop(pub: any, wal: any, cfg: Cfg) {
         if (inFlight.has(key)) continue;
 
         try {
-          // 1) Balance
+          // 1) current balance
           const bal: bigint = await pub.readContract({
             address: pos.token,
             abi: erc20Abi,
             functionName: 'balanceOf',
             args: [wal.account.address as Address],
           });
-          if (bal === 0n) continue;
+          if (bal === 0n) { removePosition(pos.token as Address); continue; }
 
-          // 2) Min hold
+          // 2) min hold
           if (blockNumber - pos.firstSeenBlock < BigInt(cfg.minHoldBlocks)) continue;
 
-          // 3) Quote gross sell value (KAS out)
+          // 3) gross quote
           let kasOut: bigint;
           try {
             kasOut = await pub.readContract({
@@ -102,56 +100,73 @@ export function startSellLoop(pub: any, wal: any, cfg: Cfg) {
           }
           if (kasOut === 0n) continue;
 
-          // 4) Estimate sell gas to compute NET P&L
+          // 4) estimate sell gas → NET proceeds
           let estGas: bigint;
           try {
             const sim = await pub.simulateContract({
               address: pos.curve,
               abi: curveSellAbi,
               functionName: 'sellTokens',
-              args: [bal, 1n],   // loose minOut to estimate gas
+              args: [bal, 1n], // loose minOut just to get gas
               account: wal.account,
             });
             estGas = sim?.request?.gas ?? 120_000n;
           } catch {
-            estGas = 120_000n;   // conservative fallback
+            estGas = 120_000n;
           }
 
-          // Fee: prefer estimateFeesPerGas, fallback to getGasPrice
           let maxFeePerGas: bigint;
           try {
-            const f = await pub.estimateFeesPerGas();
-            maxFeePerGas = f.maxFeePerGas!;
+            maxFeePerGas = (await pub.estimateFeesPerGas()).maxFeePerGas!;
           } catch {
             maxFeePerGas = await pub.getGasPrice();
           }
 
           const sellGasWei = estGas * maxFeePerGas;
-          const netKasWei = kasOut - sellGasWei; // proceeds after paying sell gas
+          const netKasWei = kasOut - sellGasWei;
 
-          // 5) PnL vs cost basis (which already includes buy gas from onBuy)
+          // 5) P&L (buy cost already includes buy gas)
           const denom = pos.totalCostWei === 0n ? 1n : pos.totalCostWei;
           const pnlBps = Number(((netKasWei - pos.totalCostWei) * 10000n) / denom);
 
+          // **fix**: SL only if > 0
+          const useSL = typeof cfg.hardStopBps === 'number' && cfg.hardStopBps > 0;
           const shouldTP = pnlBps >= cfg.takeProfitBps;
-          const shouldSL = pnlBps <= -cfg.hardStopBps;
+          const shouldSL = useSL && pnlBps <= -cfg.hardStopBps;
           if (!shouldTP && !shouldSL) continue;
 
-          // 6) Guard against concurrent processing
+          // 6) enter critical section
           inFlight.add(key);
 
-          // 7) Ensure allowance (and wait for receipts)
+          // 7) allowance (wait receipts)
           await ensureAllowance(pub, wal, pos.token as Address, pos.curve as Address, bal);
 
-          // 8) Compute minOut using slippage
-          const minOut = (kasOut * BigInt(10000 - cfg.slippageBps)) / 10000n;
+          // 8) re-check balance right before sell (handles transfers/partial sells)
+          const bal2: bigint = await pub.readContract({
+            address: pos.token,
+            abi: erc20Abi,
+            functionName: 'balanceOf',
+            args: [wal.account.address as Address],
+          });
+          if (bal2 === 0n) { removePosition(pos.token as Address); inFlight.delete(key); continue; }
 
-          // 9) Simulate THEN send
+          // 9) recompute minOut from current quote & slippage
+          const kasOut2: bigint = await pub.readContract({
+            address: pos.curve,
+            abi: curveSellAbi,
+            functionName: 'previewSellTokens',
+            args: [bal2],
+          });
+          if (kasOut2 === 0n) { inFlight.delete(key); continue; }
+
+          const minOut = (kasOut2 * BigInt(10000 - cfg.slippageBps)) / 10000n;
+
+          // 10) simulate then send, wait receipt, clear position
           await pub.simulateContract({
             address: pos.curve,
             abi: curveSellAbi,
             functionName: 'sellTokens',
-            args: [bal, minOut],
+            args: [bal2, minOut],
             account: wal.account,
           });
 
@@ -159,15 +174,23 @@ export function startSellLoop(pub: any, wal: any, cfg: Cfg) {
             address: pos.curve,
             abi: curveSellAbi,
             functionName: 'sellTokens',
-            args: [bal, minOut],
+            args: [bal2, minOut],
           });
 
-          console.log(
-            `[Seller] token=${pos.token} curve=${pos.curve} sell-all tx=${tx} pnlBps=${pnlBps}`
-          );
+          console.log(`[Seller] token=${pos.token} curve=${pos.curve} sell-all tx=${tx} pnlBps=${pnlBps}`);
+
+          const rcpt = await pub.waitForTransactionReceipt({ hash: tx });
+          if (rcpt.status === 'success') {
+            removePosition(pos.token as Address);
+          }
+
         } catch (e: any) {
-          if (String(e?.shortMessage || e?.message || '').includes('insufficient allowance')) {
-            console.warn('[Seller] allowance race; will retry next block');
+          const msg = String(e?.shortMessage || e?.message || '');
+          if (msg.includes('insufficient allowance')) {
+            console.warn('[Seller] allowance race; will retry');
+          } else if (msg.includes('transfer amount exceeds balance')) {
+            console.warn('[Seller] balance changed / already sold; clearing position');
+            removePosition((e?.token as Address) ?? (e?.address as Address) ?? undefined as any);
           } else {
             console.error('[Seller] error', e);
           }
@@ -178,10 +201,7 @@ export function startSellLoop(pub: any, wal: any, cfg: Cfg) {
     },
 
     onError: (e: any) => {
-      if (
-        e?.name === 'BlockNotFoundError' ||
-        String(e?.shortMessage || '').includes('Block at number')
-      ) {
+      if (String(e?.shortMessage || '').includes('Block at number')) {
         if (DBG) console.warn('[SellLoop] transient BlockNotFound (ignored)');
         return;
       }
