@@ -1,31 +1,21 @@
 {
-  "lfg": {
-    "factoryAddress": "0xb19219AF8a65522f13B51f6401093c8342E27e9D"
-  },
+  "lfg": { "factoryAddress": "0xb19219AF8a65522f13B51f6401093c8342E27e9D" },
   "connection": {
-    "rpc": {
-      "url": "https://evmrpc.kasplex.org"
-    },
-    "ws": {
-      "url": "wss://evmws.kasplex.org"
-    },
+    "rpc": { "url": "https://evmrpc.kasplex.org" },
+    "ws":  { "url": "wss://evmws.kasplex.org" },
     "network": {
       "name": "Kasplex Mainnet",
       "chainId": 202555,
-      "nativeCurrency": {
-        "decimals": 18,
-        "name": "Wrapped Kaspa",
-        "symbol": "WKAS"
-      }
+      "nativeCurrency": { "decimals": 18, "name": "Wrapped Kaspa", "symbol": "WKAS" }
     }
   },
-  "wallet": {
-    "privateKey": "0x0000000000000000000000000000000000000000"
-  },
   "bot": {
-    "purchaseAmount": "69000000000000000000",
-    "slippageBps": 100,
-    "gasBribeBps": 50,
-    "maxDevBuySupplyBps": 100
-  }
+    "purchaseAmount": "1000000000000000000",
+    "slippageBps": 300,
+    "gasBribeBps": 1000,
+    "maxDevBuySupplyBps": 10
+  },
+  "filters": { "onlyHyped": true },
+  "sell": { "enabled": true, "takeProfitBps": 6000, "hardStopBps": 0, "minHoldBlocks": 3 }
 }
+
